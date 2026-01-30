@@ -53,8 +53,8 @@ flowchart TD
   user[User] --> web[Local Web UI]
   web --> api[FastAPI]
   api --> gmail[Gmail API]
-  api --> preprocess[Preprocess / Thread Merge]
-  preprocess --> llm[LLM (OpenAI / Anthropic)]
+  api --> preprocess["Preprocess / Thread Merge"]
+  preprocess --> llm["LLM (OpenAI / Anthropic)"]
   llm --> report[Report Assembler]
   report --> db[(SQLite)]
   db --> web

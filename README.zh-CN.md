@@ -54,7 +54,7 @@ flowchart TD
   web --> api[FastAPI]
   api --> gmail[GmailAPI]
   api --> preprocess[PreprocessThreads]
-  preprocess --> llm[LLM (OpenAI / Anthropic)]
+  preprocess --> llm["LLM (OpenAI / Anthropic)"]
   llm --> report[ReportAssembler]
   report --> db[(SQLite)]
   db --> web

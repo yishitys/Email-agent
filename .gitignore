@@ -1,0 +1,36 @@
+# Environment variables
+.env
+
+# OAuth / API credentials (never commit)
+credentials.json
+
+# Local data
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# Windows oddities / temp files
+nul
+
+# OS
+.DS_Store
+Thumbs.db

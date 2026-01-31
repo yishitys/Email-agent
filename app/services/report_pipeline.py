@@ -246,89 +246,91 @@ class ReportPipeline:
         """
         生成降级摘要（不使用 AI）
 
+        与 AI 报告格式一致：重要（score>=20）仅 3 字段，非重要仅发件人+一句话摘要。
+        保留 ## ⚡ 今日重点 与 ## ✅ 行动清单 以兼容解析器。
+
         Args:
             scored_threads: 评分后的线程列表
 
         Returns:
             Markdown 格式的简单报告
         """
-        # 按优先级分组
-        high_priority = []
-        medium_priority = []
-        low_priority = []
+        # 按 score>=20 分为重要 / 非重要
+        important = [(t, s) for t, s in scored_threads if s >= 20]
+        non_important = [(t, s) for t, s in scored_threads if s < 20]
 
-        total_emails = 0
-        for thread, score in scored_threads:
-            total_emails += thread.total_messages
-            if score >= 15:
-                high_priority.append((thread, score))
-            elif score >= 5:
-                medium_priority.append((thread, score))
-            else:
-                low_priority.append((thread, score))
-
-        # 生成 Markdown 报告
+        total_emails = sum(t.total_messages for t, _ in scored_threads)
         report_parts = [
-            "## 邮件摘要（简化版）",
             "*此报告未使用 AI 生成*",
             ""
         ]
 
-        # 高优先级邮件
-        if high_priority:
-            report_parts.append("### 高优先级邮件")
-            report_parts.append("")
-            for thread, score in high_priority[:10]:
-                sender_name = "未知发件人"
-                if thread.messages:
-                    first_msg = thread.messages[0]
-                    sender_name = first_msg.sender_name or first_msg.from_addr or "未知"
-
-                report_parts.append(f"**{thread.subject}**")
-                report_parts.append(f"- 发件人: {sender_name}")
-                report_parts.append(f"- 重要性: {score:.1f}")
-                report_parts.append(f"- 邮件数: {thread.total_messages}")
-
-                if thread.has_attachments:
-                    report_parts.append("- 📎 包含附件")
-
-                # 摘要片段
-                if thread.messages and thread.messages[0].snippet:
-                    snippet = thread.messages[0].snippet[:100]
-                    report_parts.append(f"- 内容: {snippet}...")
-
-                report_parts.append("")
-
-        # 中等优先级
-        if medium_priority:
-            report_parts.append("### 中等优先级邮件")
-            report_parts.append("")
-            for thread, score in medium_priority[:10]:
-                sender_name = "未知"
-                if thread.messages:
-                    first_msg = thread.messages[0]
-                    sender_name = first_msg.sender_name or first_msg.from_addr or "未知"
-
-                report_parts.append(f"- **{thread.subject}** (发件人: {sender_name}, 重要性: {score:.1f})")
-
-            report_parts.append("")
-
-        # 统计信息
-        report_parts.append("### 统计信息")
+        # ## 📧 重要邮件：仅 发件人 / 时间 / 内容摘要
+        report_parts.append("## 📧 重要邮件")
         report_parts.append("")
-        report_parts.append(f"- 总线程数: {len(scored_threads)}")
-        report_parts.append(f"- 总邮件数: {total_emails}")
-        report_parts.append(f"- 高优先级: {len(high_priority)}")
-        report_parts.append(f"- 中等优先级: {len(medium_priority)}")
-        report_parts.append(f"- 低优先级: {len(low_priority)}")
+        if important:
+            for thread, _ in important[:20]:
+                sender_display = "未知发件人"
+                time_str = "未知"
+                snippet = ""
+                if thread.messages:
+                    msg = thread.messages[0]
+                    sender_display = msg.sender_name or msg.from_addr or "未知"
+                    time_str = msg.date.strftime("%Y-%m-%d %H:%M") if msg.date else "未知"
+                    snippet = (msg.snippet or "")[:200]
+                    if len(msg.snippet or "") > 200:
+                        snippet += "..."
+                report_parts.append(f"**{thread.subject}**")
+                report_parts.append(f"- **发件人**: {sender_display}")
+                report_parts.append(f"- **时间**: {time_str}")
+                report_parts.append(f"- **内容摘要**: {snippet or '（无摘要）'}")
+                report_parts.append("")
+        else:
+            report_parts.append("（无）")
+            report_parts.append("")
+
+        # ## 📋 非重要邮件：发件人 + 一句话摘要
+        report_parts.append("## 📋 非重要邮件")
+        report_parts.append("")
+        if non_important:
+            for thread, _ in non_important[:30]:
+                sender_display = "未知"
+                one_line = ""
+                if thread.messages:
+                    msg = thread.messages[0]
+                    sender_display = msg.sender_name or msg.from_addr or "未知"
+                    one_line = (msg.snippet or thread.subject or "")[:80]
+                    if len(msg.snippet or thread.subject or "") > 80:
+                        one_line += "..."
+                report_parts.append(f"**{thread.subject}** — **发件人**: {sender_display}。{one_line}")
+            report_parts.append("")
+        else:
+            report_parts.append("（无）")
+            report_parts.append("")
+
+        # ## ⚡ 今日重点
+        report_parts.append("## ⚡ 今日重点")
+        report_parts.append("")
+        report_parts.append(f"- 共收到 {len(scored_threads)} 个邮件线程，{total_emails} 封邮件")
+        if important:
+            report_parts.append("- 请优先查看「重要邮件」章节")
+        report_parts.append("")
+
+        # ## ✅ 行动清单
+        report_parts.append("## ✅ 行动清单")
+        report_parts.append("")
+        if important:
+            report_parts.append("- [ ] 查看并处理重要邮件")
+        report_parts.append("- [ ] 浏览非重要邮件摘要")
+        report_parts.append("")
 
         markdown_content = "\n".join(report_parts)
 
         return {
             'format': 'markdown',
             'full_content': markdown_content,
-            'highlights': [f"共收到 {len(scored_threads)} 个邮件线程"],
-            'todos': ["查看高优先级邮件"] if high_priority else ["查看今日邮件"],
+            'highlights': [f"共收到 {len(scored_threads)} 个邮件线程"] + (["请优先查看重要邮件"] if important else []),
+            'todos': ["查看并处理重要邮件"] if important else ["查看今日邮件"],
             'sections': {}
         }
 

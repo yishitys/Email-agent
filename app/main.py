@@ -7,6 +7,7 @@ from app.core.config import config
 from app.core.logging import get_logger
 from app.db.session import init_db
 from app.web.routes import auth
+from app.web.routes import reports
 
 # 获取日志记录器
 logger = get_logger(__name__)
@@ -20,6 +21,7 @@ app = FastAPI(
 
 # 挂载路由
 app.include_router(auth.router)
+app.include_router(reports.router)
 
 
 @app.on_event("startup")

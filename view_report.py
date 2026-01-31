@@ -172,7 +172,10 @@ def export_report(report_date):
     # 写入文件
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(f"# 📧 邮件报告 - {report_date.strftime('%Y年%m月%d日')}\n\n")
-        f.write(f"生成时间: {report.get('created_at', 'N/A')}\n\n")
+        # “同一天重复生成报告”会更新 summary/引用，但 created_at 仍是首次创建时间。
+        # 导出时用 updated_at（最后生成/更新时间）更符合预期。
+        generated_at = report.get('updated_at') or report.get('created_at') or 'N/A'
+        f.write(f"生成时间: {generated_at}\n\n")
         f.write("---\n\n")
 
         if summary.get('format') == 'markdown':

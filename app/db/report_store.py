@@ -164,7 +164,14 @@ class SkillReportStore:
             报告字典；如果不存在返回 None
         """
         def _get(session: Session) -> Optional[Dict[str, Any]]:
-            report = session.query(Report).filter(Report.date == report_date).first()
+            # 理论上 reports.date 应该是唯一的；但为了兼容历史数据库/异常数据，
+            # 这里始终按更新时间倒序取“最新”的那一条。
+            report = (
+                session.query(Report)
+                .filter(Report.date == report_date)
+                .order_by(Report.updated_at.desc(), Report.id.desc())
+                .first()
+            )
             if not report:
                 logger.info(f"日期 {report_date} 没有报告")
                 return None
@@ -263,6 +270,10 @@ class SkillReportStore:
         Returns:
             报告字典
         """
+        refs = list(report.email_references)
+        ref_count = len(refs)
+        thread_count = len(set(ref.thread_id for ref in refs if ref.thread_id))
+
         return {
             "id": report.id,
             "date": report.date.isoformat(),
@@ -281,6 +292,9 @@ class SkillReportStore:
                     "snippet": ref.snippet,
                     "gmail_url": ref.gmail_url,
                 }
-                for ref in report.email_references
-            ]
+                for ref in refs
+            ],
+            "email_count": ref_count,
+            "thread_count": thread_count,
+            "reference_count": ref_count,
         }

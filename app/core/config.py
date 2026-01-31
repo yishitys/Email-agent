@@ -15,6 +15,17 @@ load_dotenv()
 class Config:
     """应用配置类"""
 
+    @staticmethod
+    def _get_int(name: str, default: int) -> int:
+        """从环境变量读取 int 配置（失败则回退默认值）"""
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except Exception:
+            return default
+
     # AI 提供商配置
     AI_PROVIDER: str = os.getenv("AI_PROVIDER", "claude")  # "openai" 或 "claude"
 
@@ -30,6 +41,8 @@ class Config:
     APP_BASE_URL: str = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000")
 
     # Gmail 配置
+    # 拉取邮件最大数量：0 或负数表示不限制（会分页拉取直到没有 nextPageToken）
+    GMAIL_MAX_RESULTS: int = _get_int.__func__("GMAIL_MAX_RESULTS", 500)
     # credentials.json 路径，优先查找项目根目录，其次是 data/ 目录
     _credentials_path = os.getenv("GMAIL_CREDENTIALS_PATH")
     if _credentials_path:
@@ -59,6 +72,13 @@ class Config:
     # 日志配置
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+    # Prompt/总结策略
+    # 单次 prompt 最多包含多少个线程；更大的量应该在管线里分批总结再汇总
+    PROMPT_MAX_THREADS: int = _get_int.__func__("PROMPT_MAX_THREADS", 50)
+
+    # 报告保存时，最多保存多少个线程的邮件引用；0 或负数表示保存全部线程引用
+    REPORT_MAX_REF_THREADS: int = _get_int.__func__("REPORT_MAX_REF_THREADS", 200)
+
     @classmethod
     def get_safe_config(cls) -> dict:
         """
@@ -71,6 +91,9 @@ class Config:
             "ANTHROPIC_MODEL": cls.ANTHROPIC_MODEL,
             "ANTHROPIC_API_KEY": cls._mask_sensitive(cls.ANTHROPIC_API_KEY),
             "APP_BASE_URL": cls.APP_BASE_URL,
+            "GMAIL_MAX_RESULTS": cls.GMAIL_MAX_RESULTS,
+            "PROMPT_MAX_THREADS": cls.PROMPT_MAX_THREADS,
+            "REPORT_MAX_REF_THREADS": cls.REPORT_MAX_REF_THREADS,
             "GMAIL_CREDENTIALS_PATH": str(cls.GMAIL_CREDENTIALS_PATH),
             "GMAIL_TOKEN_PATH": str(cls.GMAIL_TOKEN_PATH),
             "DATABASE_PATH": str(cls.DATABASE_PATH),

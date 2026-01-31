@@ -82,7 +82,7 @@ class SkillGmailFetch:
         starred_only: bool = False,
         sender: Optional[str] = None,
         keyword: Optional[str] = None,
-        max_results: int = 100
+        max_results: Optional[int] = 100
     ) -> List[MessageSummary]:
         """
         拉取邮件列表
@@ -96,7 +96,7 @@ class SkillGmailFetch:
             starred_only: 只拉取星标邮件
             sender: 发件人过滤
             keyword: 关键词搜索
-            max_results: 最大返回数量
+            max_results: 最大返回数量；0/负数/None 表示不限制（会分页拉取直到没有 nextPageToken）
 
         Returns:
             邮件摘要列表
@@ -133,13 +133,15 @@ class SkillGmailFetch:
             page_token = None
             fetched_count = 0
 
-            while fetched_count < max_results:
+            unlimited = (max_results is None) or (max_results <= 0)
+
+            while unlimited or fetched_count < max_results:
                 try:
                     # 列出消息（带重试）
                     results = SkillGmailFetch._list_messages_with_retry(
                         service,
                         query=query,
-                        max_results=min(max_results - fetched_count, 100),
+                        max_results=100 if unlimited else min(max_results - fetched_count, 100),
                         page_token=page_token
                     )
 
@@ -175,6 +177,13 @@ class SkillGmailFetch:
                         continue
                     else:
                         raise
+
+            # 如果触发了上限且还有下一页，提示可能存在未拉取的邮件
+            if (not unlimited) and max_results is not None and fetched_count >= max_results and page_token:
+                logger.warning(
+                    f"已达到 max_results={max_results} 上限，但仍存在下一页（nextPageToken 不为空）。"
+                    f" 这会导致部分邮件未被拉取；请提高 GMAIL_MAX_RESULTS 或设置为 0 以不限制。"
+                )
 
             logger.info(f"成功拉取 {len(messages)} 封邮件")
             return messages

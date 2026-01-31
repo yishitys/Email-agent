@@ -5,7 +5,7 @@
 """
 import re
 from datetime import date, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 from google.oauth2.credentials import Credentials
 
@@ -72,12 +72,13 @@ class ReportPipeline:
 
             # Step 2: 拉取邮件
             logger.info("步骤 2/7: 拉取邮件")
+            gmail_max_results = getattr(app_config, "GMAIL_MAX_RESULTS", 100)
             if last_n_hours:
                 # 最近 N 小时
                 messages = SkillGmailFetch.fetch_messages(
                     credentials=credentials,
                     last_n_hours=last_n_hours,
-                    max_results=100
+                    max_results=gmail_max_results
                 )
                 logger.info(f"✓ 拉取了最近 {last_n_hours} 小时的 {len(messages)} 封邮件")
             else:
@@ -86,7 +87,7 @@ class ReportPipeline:
                     credentials=credentials,
                     date_from=report_date,
                     date_to=report_date,
-                    max_results=100
+                    max_results=gmail_max_results
                 )
                 logger.info(f"✓ 拉取了 {len(messages)} 封邮件")
 
@@ -108,6 +109,10 @@ class ReportPipeline:
             threads = SkillThreadMerge.merge_threads(normalized_emails)
             logger.info(f"✓ 合并为 {len(threads)} 个线程")
 
+            truncated_threads = sum(1 for t in threads if getattr(t, "is_truncated", False))
+            if truncated_threads:
+                logger.warning(f"有 {truncated_threads}/{len(threads)} 个线程因内容过长被截断（ThreadMerge.MAX_COMBINED_LENGTH 限制）")
+
             # Step 5: 重要性评分
             logger.info("步骤 5/7: 重要性评分")
             scorer = SkillImportanceHeuristics()
@@ -117,31 +122,13 @@ class ReportPipeline:
             # Step 6: 生成 Prompt 并调用 AI
             ai_provider = app_config.AI_PROVIDER
             logger.info(f"步骤 6/7: 调用 {ai_provider.upper()} 生成报告")
-            system_prompt, user_prompt = SkillPromptCompose.compose(
-                scored_threads,
-                report_date
-            )
 
             try:
-                # 根据配置选择 AI 提供商
-                if ai_provider == "claude":
-                    ai_client = SkillClaudeSummarize()
-                    ai_response = ai_client.summarize(system_prompt, user_prompt)
-                else:  # openai
-                    ai_client = SkillGptSummarize()
-                    ai_response = ai_client.summarize(system_prompt, user_prompt)
-
-                # 根据格式解析响应
-                if ai_response.get('format') == 'markdown':
-                    summary = ReportPipeline._parse_markdown_report(ai_response['content'])
-                else:
-                    summary = ai_response  # 旧 JSON 格式
-
-                # 验证报告结构
-                if not ai_client.validate_report(ai_response):
-                    logger.warning("AI 返回的报告结构不完整，使用默认结构")
-                    summary = ReportPipeline._fix_report_structure(summary)
-
+                summary = ReportPipeline._generate_ai_summary(
+                    scored_threads=scored_threads,
+                    report_date=report_date,
+                    ai_provider=ai_provider
+                )
                 logger.info(f"✓ {ai_provider.upper()} 报告生成成功")
 
             except (GptError, ClaudeError) as e:
@@ -155,7 +142,12 @@ class ReportPipeline:
 
             # 构建邮件引用
             email_refs = []
-            for thread, score in scored_threads[:20]:  # 最多保存 20 个线程的引用
+            max_ref_threads = getattr(app_config, "REPORT_MAX_REF_THREADS", 20)
+            ref_threads = scored_threads if (max_ref_threads is None or max_ref_threads <= 0) else scored_threads[:max_ref_threads]
+            if max_ref_threads is not None and max_ref_threads > 0 and len(scored_threads) > max_ref_threads:
+                logger.warning(f"邮件引用仅保存前 {max_ref_threads} 个线程（共 {len(scored_threads)} 个）。可通过 REPORT_MAX_REF_THREADS 调整。")
+
+            for thread, score in ref_threads:
                 for msg in thread.messages:
                     email_refs.append({
                         'message_id': msg.message_id,
@@ -335,6 +327,268 @@ class ReportPipeline:
         }
 
     @staticmethod
+    def _generate_ai_summary(
+        scored_threads,
+        report_date: date,
+        ai_provider: str,
+    ) -> Dict[str, Any]:
+        """
+        生成 AI 报告摘要（支持线程分批总结，避免只总结前 N 个线程）
+        """
+        max_threads_per_prompt = getattr(app_config, "PROMPT_MAX_THREADS", 50)
+        if max_threads_per_prompt is None or max_threads_per_prompt <= 0:
+            max_threads_per_prompt = len(scored_threads)
+
+        # 分批
+        batches = [
+            scored_threads[i:i + max_threads_per_prompt]
+            for i in range(0, len(scored_threads), max_threads_per_prompt)
+        ]
+
+        def call_ai(system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+            if ai_provider == "claude":
+                ai_client = SkillClaudeSummarize()
+                return ai_client.summarize(system_prompt, user_prompt)
+            ai_client = SkillGptSummarize()
+            return ai_client.summarize(system_prompt, user_prompt)
+
+        # 先对每个 batch 生成一份报告（我们只取其中“重要/非重要”两节，后续统一汇总重点与待办）
+        batch_reports: list[Dict[str, Any]] = []
+        for idx, batch in enumerate(batches, 1):
+            logger.info(f"分批总结线程：{idx}/{len(batches)}（本批 {len(batch)} 个线程）")
+            parsed = ReportPipeline._generate_batch_with_coverage_check(
+                batch=batch,
+                report_date=report_date,
+                call_ai=call_ai,
+            )
+            batch_reports.append(parsed)
+
+        # 汇总“重要邮件/非重要邮件”两节内容
+        def pick_section(sections: Dict[str, str], preferred_titles: list[str]) -> str:
+            for t in preferred_titles:
+                v = sections.get(t)
+                if v and v.strip():
+                    return v.strip()
+            return ""
+
+        important_chunks = []
+        non_important_chunks = []
+        for br in batch_reports:
+            sections = br.get("sections", {}) or {}
+            important = pick_section(sections, ["📧 重要邮件", "重要邮件"])
+            non_important = pick_section(sections, ["📋 非重要邮件", "非重要邮件"])
+            if important:
+                important_chunks.append(important)
+            if non_important:
+                non_important_chunks.append(non_important)
+
+        important_section = "\n\n".join(important_chunks).strip() or "（无）"
+        non_important_section = "\n\n".join(non_important_chunks).strip() or "（无）"
+
+        # 基于汇总后的“重要/非重要”章节，再生成一次“今日重点/行动清单”（内容更短、更不易超限）
+        finalize_system = "你是一个专业的邮件助手。请用中文 Markdown 输出指定章节，内容要具体、可执行。"
+        finalize_user = "\n".join([
+            "请根据以下已整理的邮件摘要，生成**仅包含**这两个章节（顺序不可变）：",
+            "",
+            "## ⚡ 今日重点",
+            "",
+            "3-5条最关键的发现或待办事项（尽量从重要邮件中提炼）。",
+            "",
+            "## ✅ 行动清单",
+            "",
+            "具体的待办事项列表（用 Markdown 列表，可带复选框）。",
+            "",
+            "---",
+            "",
+            "以下是整理好的摘要：",
+            "",
+            "## 📧 重要邮件",
+            important_section,
+            "",
+            "## 📋 非重要邮件",
+            non_important_section,
+        ])
+
+        finalize_resp = call_ai(finalize_system, finalize_user)
+        if finalize_resp.get("format") == "markdown":
+            finalize_parsed = ReportPipeline._parse_markdown_report(finalize_resp["content"])
+        else:
+            finalize_parsed = ReportPipeline._fix_report_structure(finalize_resp)
+
+        final_sections = finalize_parsed.get("sections", {}) or {}
+        highlights_body = pick_section(final_sections, ["⚡ 今日重点", "今日重点", "重点"]) or "（无）"
+        todos_body = pick_section(final_sections, ["✅ 行动清单", "行动清单", "待办事项", "待办"]) or "（无）"
+
+        full_markdown = "\n".join([
+            "## 📧 重要邮件",
+            "",
+            important_section,
+            "",
+            "## 📋 非重要邮件",
+            "",
+            non_important_section,
+            "",
+            "## ⚡ 今日重点",
+            "",
+            highlights_body,
+            "",
+            "## ✅ 行动清单",
+            "",
+            todos_body,
+        ]).strip()
+
+        return ReportPipeline._parse_markdown_report(full_markdown)
+
+    @staticmethod
+    def _extract_thread_tags(text: str) -> set:
+        """从章节文本中提取 [Txx] 标签集合，如 {'T01', 'T02'}"""
+        if not text:
+            return set()
+        tags = re.findall(r'\[(T\d+)\]', text, re.IGNORECASE)
+        return {t.upper() for t in tags}
+
+    @staticmethod
+    def _validate_batch_coverage(parsed: Dict[str, Any], batch_size: int) -> Tuple[bool, set]:
+        """
+        校验重要+非重要章节中 [Txx] 是否覆盖全部线程。
+        Returns: (是否通过, 缺失的标签集合)
+        """
+        def pick_section(sections: Dict[str, str], preferred_titles: list[str]) -> str:
+            for t in preferred_titles:
+                v = sections.get(t)
+                if v and v.strip():
+                    return v.strip()
+            return ""
+
+        sections = parsed.get("sections", {}) or {}
+        important = pick_section(sections, ["📧 重要邮件", "重要邮件"])
+        non_important = pick_section(sections, ["📋 非重要邮件", "非重要邮件"])
+        found = ReportPipeline._extract_thread_tags(important) | ReportPipeline._extract_thread_tags(non_important)
+        expected = {f"T{i:02d}" for i in range(1, batch_size + 1)}
+        missing = expected - found
+        return (len(missing) == 0, missing)
+
+    @staticmethod
+    def _generate_batch_with_coverage_check(
+        batch: list,
+        report_date: date,
+        call_ai,
+    ) -> Dict[str, Any]:
+        """
+        生成单个 batch 的报告，若覆盖率不足则发起补齐重试。
+        """
+        system_prompt, user_prompt = SkillPromptCompose.compose(batch, report_date)
+        ai_response = call_ai(system_prompt, user_prompt)
+
+        if ai_response.get("format") == "markdown":
+            parsed = ReportPipeline._parse_markdown_report(ai_response["content"])
+        else:
+            parsed = ai_response
+            parsed = ReportPipeline._fix_report_structure(parsed)
+
+        ok, missing = ReportPipeline._validate_batch_coverage(parsed, len(batch))
+        if ok:
+            return parsed
+
+        logger.warning(f"本批 {len(batch)} 个线程，缺失 {len(missing)} 条: {sorted(missing)}，发起补齐重试")
+        supplement = ReportPipeline._generate_supplement_for_missing(
+            batch=batch,
+            report_date=report_date,
+            missing_tags=missing,
+            call_ai=call_ai,
+        )
+        if supplement:
+            parsed = ReportPipeline._merge_supplement_into_parsed(parsed, supplement)
+            ok2, missing2 = ReportPipeline._validate_batch_coverage(parsed, len(batch))
+            if not ok2:
+                logger.warning(f"补齐后仍缺失 {len(missing2)} 条: {sorted(missing2)}")
+        return parsed
+
+    @staticmethod
+    def _generate_supplement_for_missing(
+        batch: list,
+        report_date: date,
+        missing_tags: set,
+        call_ai,
+    ) -> Optional[Dict[str, str]]:
+        """
+        为缺失的 [Txx] 生成补齐内容。返回 {'important': str, 'non_important': str} 或 None。
+        """
+        # 建立 tag -> (thread, score) 映射
+        tag_to_item = {}
+        for i, (thread, score) in enumerate(batch, 1):
+            tag = f"T{i:02d}"
+            tag_to_item[tag] = (thread, score)
+
+        missing_list = sorted(missing_tags)
+        supplement_threads = []
+        for tag in missing_list:
+            if tag in tag_to_item:
+                supplement_threads.append((tag, tag_to_item[tag]))
+
+        if not supplement_threads:
+            return None
+
+        # 构建仅包含缺失线程的 prompt
+        user_parts = [
+            f"以下 {len(supplement_threads)} 个线程在之前的报告中遗漏，请**仅**为它们输出条目，格式与之前相同。",
+            "",
+            "缺失的线程及其在输出中的标签：",
+            ""
+        ]
+        for tag, (thread, score) in supplement_threads:
+            user_parts.append(f"### [{tag}] 线程 (重要性: {score:.1f})")
+            user_parts.append(f"主题: {thread.subject}")
+            user_parts.append(f"邮件数: {thread.total_messages}")
+            if thread.participants:
+                user_parts.append(f"参与者: {', '.join(thread.participants[:3])}")
+            if thread.has_attachments:
+                user_parts.append("📎 包含附件")
+            user_parts.append(f"内容:\n{thread.combined_text[:2000]}")  # 限制长度
+            user_parts.append("")
+
+        user_parts.append("请按以下格式输出，分数>=20 的放入 ## 📧 重要邮件，<20 的放入 ## 📋 非重要邮件：")
+        user_parts.append("- 重要: **[Txx] 主题** + 发件人、时间、内容摘要")
+        user_parts.append("- 非重要: **[Txx] 主题** — **发件人**: xxx。一句话摘要。")
+
+        sup_system = "你是一个专业的邮件助手。请严格按照格式输出，每条标题必须以对应的 [Txx] 开头。"
+        sup_user = "\n".join(user_parts)
+
+        try:
+            resp = call_ai(sup_system, sup_user)
+            content = resp.get("content", "").strip() if resp.get("format") == "markdown" else ""
+            if not content:
+                return None
+            sup_parsed = ReportPipeline._parse_markdown_report(content)
+            sections = sup_parsed.get("sections", {}) or {}
+            important = sections.get("📧 重要邮件", "").strip() or sections.get("重要邮件", "").strip()
+            non_important = sections.get("📋 非重要邮件", "").strip() or sections.get("非重要邮件", "").strip()
+            return {"important": important, "non_important": non_important}
+        except Exception as e:
+            logger.warning(f"补齐重试失败: {e}")
+            return None
+
+    @staticmethod
+    def _merge_supplement_into_parsed(parsed: Dict[str, Any], supplement: Dict[str, str]) -> Dict[str, Any]:
+        """将补齐内容追加到 parsed 的对应章节。"""
+        sections = parsed.get("sections", {}) or {}
+        imp_key = "📧 重要邮件" if "📧 重要邮件" in sections else "重要邮件"
+        non_key = "📋 非重要邮件" if "📋 非重要邮件" in sections else "非重要邮件"
+
+        imp_cur = sections.get(imp_key, "").strip()
+        non_cur = sections.get(non_key, "").strip()
+        imp_add = (supplement.get("important") or "").strip()
+        non_add = (supplement.get("non_important") or "").strip()
+
+        if imp_add:
+            sections[imp_key] = (imp_cur + "\n\n" + imp_add).strip() if imp_cur else imp_add
+        if non_add:
+            sections[non_key] = (non_cur + "\n\n" + non_add).strip() if non_cur else non_add
+
+        parsed["sections"] = sections
+        return parsed
+
+    @staticmethod
     def _parse_markdown_report(markdown_content: str) -> Dict[str, Any]:
         """
         从 Markdown 报告中提取结构化数据
@@ -362,7 +616,11 @@ class ReportPipeline:
 
         try:
             # 使用正则提取章节：## 章节名\n内容...
-            sections = re.split(r'\n##\s+', markdown_content)
+            # 注意：报告内容通常以 "## ..." 开头，原实现使用 "\n##" 会漏掉首个章节。
+            content_for_split = markdown_content
+            if not content_for_split.startswith("\n"):
+                content_for_split = "\n" + content_for_split
+            sections = re.split(r'\n##\s+', content_for_split)
 
             for section in sections:
                 if not section.strip():
@@ -384,15 +642,19 @@ class ReportPipeline:
 
                 if any(keyword in title_lower for keyword in ['重点', 'highlight', '发现']):
                     # 提取列表项
-                    items = re.findall(r'^[-*]\s+(.+)$', content, re.MULTILINE)
+                    # 支持 "- xxx" / "* xxx" / "1. xxx" 三种常见格式
+                    items = []
+                    for m in re.finditer(r'^(?:[-*]|\d+\.)\s+(.+)$', content, re.MULTILINE):
+                        items.append(m.group(1).strip())
                     result['highlights'].extend(items[:7])
 
                 elif any(keyword in title_lower for keyword in ['待办', 'todo', '任务', 'task']):
                     # 提取列表项
-                    items = re.findall(r'^[-*\[\]]\s+(.+)$', content, re.MULTILINE)
-                    # 清理复选框标记
-                    cleaned_items = [re.sub(r'^\[.\]\s*', '', item) for item in items]
-                    result['todos'].extend(cleaned_items)
+                    # 支持 "- [ ] xxx" / "- [x] xxx" / "- xxx" / "1. xxx"
+                    items = []
+                    for m in re.finditer(r'^(?:[-*]|\d+\.)\s+(?:\[[ xX]\]\s*)?(.+)$', content, re.MULTILINE):
+                        items.append(m.group(1).strip())
+                    result['todos'].extend(items)
 
             # 如果没有提取到 highlights，尝试从第一段提取
             if not result['highlights'] and markdown_content:

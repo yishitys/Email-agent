@@ -50,18 +50,18 @@ class SkillPromptCompose:
 
 ## 📧 重要邮件
 
-仅包含重要性分数 >= 20 的线程。每条**只允许**以下 3 个字段，不得添加「为什么重要」「建议行动」「附件」等任何其他字段：
+仅包含重要性分数 >= 20 的线程。每条标题必须以 **[Txx]** 开头（xx 为两位数字，如 T01、T02），**只允许**以下 3 个字段，不得添加「为什么重要」「建议行动」「附件」等任何其他字段：
 
-**[邮件主题]**
+**[Txx] 邮件主题**
 - **发件人**: 姓名 (邮箱)
 - **时间**: YYYY-MM-DD HH:MM
 - **内容摘要**: 2-3句话概括邮件的主要内容
 
 ## 📋 非重要邮件
 
-仅包含重要性分数 < 20 的线程。每条**只允许**：发件人 + 一句话内容摘要，**不得**包含时间或其它字段。格式：
+仅包含重要性分数 < 20 的线程。每条标题必须以 **[Txx]** 开头，**只允许**：发件人 + 一句话内容摘要，**不得**包含时间或其它字段。格式：
 
-**[邮件主题]** — **发件人**: 姓名 (邮箱)。一句话摘要。
+**[Txx] 邮件主题** — **发件人**: 姓名 (邮箱)。一句话摘要。
 
 ## ⚡ 今日重点
 
@@ -73,29 +73,36 @@ class SkillPromptCompose:
 
 ---
 
-**重要邮件输出示例**（仅 3 字段）：
+**关键约束**：你必须为输入中的每一个线程输出一条条目，不得遗漏。每条条目的标题必须以 **[T01]**、**[T02]**、… **[TYY]** 开头（YY=线程总数），每个编号必须出现且仅出现一次。若内容不足以判断，也必须输出该线程条目，可用「（信息不足，基于片段）」作为兜底摘要，不允许省略任何线程。
 
-**验证您的邮件地址**
+**重要邮件输出示例**（仅 3 字段，注意 [Txx] 前缀）：
+
+**[T01] 验证您的邮件地址**
 - **发件人**: Anthropic Support Team (noreply@anthropic.com)
 - **时间**: 2026-01-30 09:15
 - **内容摘要**: Anthropic 要求验证邮箱地址以完成账户设置。邮件中包含验证链接，需要点击以激活账户的支付功能。如果24小时内未验证，将无法使用某些服务。
 
-**非重要邮件输出示例**（发件人 + 一句话）：
+**非重要邮件输出示例**（发件人 + 一句话，注意 [Txx] 前缀）：
 
-**促销活动** — **发件人**: 某品牌 (promo@brand.com)。推广本月折扣，无需行动。"""
+**[T02] 促销活动** — **发件人**: 某品牌 (promo@brand.com)。推广本月折扣，无需行动。"""
+
+        # 计算总邮件数
+        total_emails = sum(t.total_messages for t, _ in threads)
+        thread_count = len(threads)
 
         # 构建 user prompt
         user_parts = [
             f"请分析 {report_date.strftime('%Y年%m月%d日')} 的邮件，生成每日报告。",
             "",
-            f"共 {len(threads)} 个邮件线程：",
+            f"**共 {total_emails} 封邮件，合并为 {thread_count} 个线程**。你必须为下面列出的每一个线程（共 {thread_count} 个）输出一条条目，不得遗漏。",
             ""
         ]
 
-        # 添加每个线程（限制数量避免超长）
-        max_threads = 50  # 最多包含 50 个线程
-        for i, (thread, score) in enumerate(threads[:max_threads], 1):
-            user_parts.append(f"### 线程 {i} (重要性: {score:.1f})")
+        # 添加每个线程
+        # 注：若线程很多或内容很长，应在上层管线中分批调用 compose，
+        # 以避免单次 prompt 过长导致模型截断或遗漏。
+        for i, (thread, score) in enumerate(threads, 1):
+            user_parts.append(f"### [T{i:02d}] 线程 {i} (重要性: {score:.1f})")
             user_parts.append(f"主题: {thread.subject}")
             user_parts.append(f"邮件数: {thread.total_messages}")
 
@@ -113,13 +120,10 @@ class SkillPromptCompose:
             user_parts.append(f"内容:\n{thread.combined_text}")
             user_parts.append("")
 
-        if len(threads) > max_threads:
-            user_parts.append(f"(还有 {len(threads) - max_threads} 个线程已省略)")
-            user_parts.append("")
-
         user_parts.append("请按照系统提示词中的格式要求生成报告。")
         user_parts.append("")
         user_parts.append("重要约束:")
+        user_parts.append("- 必须为上述每一个线程输出一条条目（共 {0} 条），每条标题必须以 **[T01]** 至 **[T{1:02d}]** 之一开头，每个编号出现且仅出现一次，不得遗漏或合并。".format(thread_count, thread_count))
         user_parts.append("- 根据每个线程标题中的「重要性」分数判断：分数 >= 20 的放入「重要邮件」章节，分数 < 20 的放入「非重要邮件」章节。")
         user_parts.append("- 重要邮件每条只允许 3 个字段：发件人、时间、内容摘要；不得添加「为什么重要」「建议行动」「附件」等任何其它字段。")
         user_parts.append("- 非重要邮件每条必须只有一句话摘要（发件人 + 一句话内容），不得包含时间或其它小节。")
